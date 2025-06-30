@@ -1,4 +1,3 @@
-/* eslint-disable import/no-cycle */
 /*
  * Fragment Block
  * Include content on a page as a fragment.
@@ -19,7 +18,7 @@ import {
  * @returns {HTMLElement} The root element of the fragment
  */
 export async function loadFragment(path) {
-  if (path && path.startsWith('/')) {
+  if (path) { //  && path.startsWith('/')
     const resp = await fetch(`${path}.plain.html`);
     if (resp.ok) {
       const main = document.createElement('main');
