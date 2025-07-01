@@ -1,21 +1,61 @@
+/* eslint-disable no-underscore-dangle */
+/* eslint-disable import/no-cycle */
+import { events } from '@dropins/tools/event-bus.js';
 import {
   buildBlock,
-  loadHeader,
-  loadFooter,
+  decorateBlocks,
   decorateButtons,
   decorateIcons,
-  decorateBlocks,
+  decorateSections,
   decorateTemplateAndTheme,
+  loadFooter,
+  loadHeader,
   getMetadata,
+  loadScript,
+  toCamelCase,
+  toClassName,
+  readBlockConfig,
   waitForFirstImage,
   loadSection,
   loadSections,
   loadCSS,
   sampleRUM,
-  readBlockConfig,
-  toClassName,
-  toCamelCase,
 } from './aem.js';
+import { trackHistory } from './commerce.js';
+import initializeDropins from './initializers/index.js';
+
+const AUDIENCES = {
+  mobile: () => window.innerWidth < 600,
+  desktop: () => window.innerWidth >= 600,
+  // define your custom audiences here as needed
+};
+
+/**
+ * Gets all the metadata elements that are in the given scope.
+ * @param {String} scope The scope/prefix for the metadata
+ * @returns an array of HTMLElement nodes that match the given scope
+ */
+export function getAllMetadata(scope) {
+  return [...document.head.querySelectorAll(`meta[property^="${scope}:"],meta[name^="${scope}-"]`)]
+    .reduce((res, meta) => {
+      const id = toClassName(meta.name
+        ? meta.name.substring(scope.length + 1)
+        : meta.getAttribute('property').split(':')[1]);
+      res[id] = meta.getAttribute('content');
+      return res;
+    }, {});
+}
+
+// Define an execution context
+const pluginContext = {
+  getAllMetadata,
+  getMetadata,
+  loadCSS,
+  loadScript,
+  sampleRUM,
+  toCamelCase,
+  toClassName,
+};
 
 /**
  * Builds hero block and prepends to main in a new section.
@@ -44,9 +84,10 @@ async function loadFonts() {
   }
 }
 
-function autolinkModals(doc) {
-  doc.addEventListener('click', async (e) => {
+function autolinkModals(element) {
+  element.addEventListener('click', async (e) => {
     const origin = e.target.closest('a');
+
     if (origin && origin.href && origin.href.includes('/modals/')) {
       e.preventDefault();
       const { openModal } = await import(`${window.hlx.codeBasePath}/blocks/modal/modal.js`);
@@ -61,7 +102,7 @@ function autolinkModals(doc) {
  */
 function buildAutoBlocks(main) {
   try {
-    if (!main.querySelector('.hero')) buildHeroBlock(main);
+    buildHeroBlock(main);
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error('Auto Blocking failed', error);
@@ -69,55 +110,32 @@ function buildAutoBlocks(main) {
 }
 
 /**
- * Decorates all sections in a container element.
+ * Decorate Columns Template to the main element.
  * @param {Element} main The container element
  */
-function decorateSections(main) {
-  main.querySelectorAll(':scope > div').forEach((section) => {
-    const wrappers = [];
-    let defaultContent = false;
-    [...section.children].forEach((e) => {
-      if (e.classList.contains('richtext')) {
-        e.removeAttribute('class');
-        if (!defaultContent) {
-          const wrapper = document.createElement('div');
-          wrapper.classList.add('default-content-wrapper');
-          wrappers.push(wrapper);
-          defaultContent = true;
-        }
-      } else if (e.tagName === 'DIV' || !defaultContent) {
-        const wrapper = document.createElement('div');
-        wrappers.push(wrapper);
-        defaultContent = e.tagName !== 'DIV';
-        if (defaultContent) wrapper.classList.add('default-content-wrapper');
-      }
-      wrappers[wrappers.length - 1].append(e);
-    });
+function buildTemplateColumns(doc) {
+  const columns = doc.querySelectorAll('main > div.section[data-column-width]');
 
-    // Add wrapped content back
-    wrappers.forEach((wrapper) => section.append(wrapper));
-    section.classList.add('section');
-    section.dataset.sectionStatus = 'initialized';
-    section.style.display = 'none';
+  columns.forEach((column) => {
+    const columnWidth = column.getAttribute('data-column-width');
+    const gap = column.getAttribute('data-gap');
 
-    // Process section metadata
-    const sectionMeta = section.querySelector('div.section-metadata');
-    if (sectionMeta) {
-      const meta = readBlockConfig(sectionMeta);
-      Object.keys(meta).forEach((key) => {
-        if (key === 'style') {
-          const styles = meta.style
-            .split(',')
-            .filter((style) => style)
-            .map((style) => toClassName(style.trim()));
-          styles.forEach((style) => section.classList.add(style));
-        } else {
-          section.dataset[toCamelCase(key)] = meta[key];
-        }
-      });
-      sectionMeta.parentNode.remove();
+    if (columnWidth) {
+      column.style.setProperty('--column-width', columnWidth);
+      column.removeAttribute('data-column-width');
+    }
+
+    if (gap) {
+      column.style.setProperty('--gap', `var(--spacing-${gap.toLocaleLowerCase()})`);
+      column.removeAttribute('data-gap');
     }
   });
+}
+
+async function applyTemplates(doc) {
+  if (doc.body.classList.contains('columns')) {
+    buildTemplateColumns(doc);
+  }
 }
 
 /**
@@ -134,24 +152,110 @@ export function decorateMain(main) {
   decorateBlocks(main);
 }
 
+function preloadFile(href, as) {
+  const link = document.createElement('link');
+  link.rel = 'preload';
+  link.as = as;
+  link.crossOrigin = 'anonymous';
+  link.href = href;
+  document.head.appendChild(link);
+}
+
 /**
  * Loads everything needed to get to LCP.
  * @param {Element} doc The container element
  */
 async function loadEager(doc) {
-  doc.documentElement.lang = 'en';
+  document.documentElement.lang = 'en';
   decorateTemplateAndTheme();
-  if (getMetadata('breadcrumbs').toLowerCase() === 'true') {
-    doc.body.dataset.breadcrumbs = true;
-  }
-  const main = doc.querySelector('main');
-  if (main) {
-    decorateMain(main);
-    doc.body.classList.add('appear');
-    await loadSection(main.querySelector('.section'), waitForFirstImage);
+
+  // Instrument experimentation plugin
+  if (getMetadata('experiment')
+    || Object.keys(getAllMetadata('campaign')).length
+    || Object.keys(getAllMetadata('audience')).length) {
+    // eslint-disable-next-line import/no-relative-packages
+    const { loadEager: runEager } = await import('../plugins/experimentation/src/index.js');
+    await runEager(document, { audiences: AUDIENCES, overrideMetadataFields: ['placeholders'] }, pluginContext);
   }
 
-  sampleRUM.enhance();
+  await initializeDropins();
+
+  window.adobeDataLayer = window.adobeDataLayer || [];
+
+  let pageType = 'CMS';
+  if (document.body.querySelector('main .product-details')) {
+    pageType = 'Product';
+
+    // initialize pdp
+    await import('./initializers/pdp.js');
+
+    // Preload PDP Dropins assets
+    preloadFile('/scripts/__dropins__/storefront-pdp/api.js', 'script');
+    preloadFile('/scripts/__dropins__/storefront-pdp/render.js', 'script');
+    preloadFile('/scripts/__dropins__/storefront-pdp/containers/ProductHeader.js', 'script');
+    preloadFile('/scripts/__dropins__/storefront-pdp/containers/ProductPrice.js', 'script');
+    preloadFile('/scripts/__dropins__/storefront-pdp/containers/ProductShortDescription.js', 'script');
+    preloadFile('/scripts/__dropins__/storefront-pdp/containers/ProductOptions.js', 'script');
+    preloadFile('/scripts/__dropins__/storefront-pdp/containers/ProductQuantity.js', 'script');
+    preloadFile('/scripts/__dropins__/storefront-pdp/containers/ProductDescription.js', 'script');
+    preloadFile('/scripts/__dropins__/storefront-pdp/containers/ProductAttributes.js', 'script');
+    preloadFile('/scripts/__dropins__/storefront-pdp/containers/ProductGallery.js', 'script');
+  } else if (document.body.querySelector('main .product-list-page')) {
+    pageType = 'Category';
+    preloadFile('/scripts/widgets/search.js', 'script');
+  } else if (document.body.querySelector('main .product-list-page-custom')) {
+    // TODO Remove this bracket if not using custom PLP
+    pageType = 'Category';
+    const plpBlock = document.body.querySelector('main .product-list-page-custom');
+    const { category, urlpath } = readBlockConfig(plpBlock);
+
+    if (category && urlpath) {
+      // eslint-disable-next-line import/no-unresolved, import/no-absolute-path
+      const { preloadCategory } = await import('/blocks/product-list-page-custom/product-list-page-custom.js');
+      preloadCategory({ id: category, urlPath: urlpath });
+    }
+  } else if (document.body.querySelector('main .commerce-cart')) {
+    pageType = 'Cart';
+  } else if (document.body.querySelector('main .commerce-checkout')) {
+    pageType = 'Checkout';
+  }
+
+  window.adobeDataLayer.push(
+    {
+      pageContext: {
+        pageType,
+        pageName: document.title,
+        eventType: 'visibilityHidden',
+        maxXOffset: 0,
+        maxYOffset: 0,
+        minXOffset: 0,
+        minYOffset: 0,
+      },
+    },
+    {
+      shoppingCartContext: {
+        totalQuantity: 0,
+      },
+    },
+  );
+  window.adobeDataLayer.push((dl) => {
+    dl.push({ event: 'page-view', eventInfo: { ...dl.getState() } });
+  });
+
+  const main = doc.querySelector('main');
+  if (main) {
+    // Main Decorations
+    decorateMain(main);
+
+    // Template Decorations
+    await applyTemplates(doc);
+
+    // Load LCP blocks
+    await loadSection(main.querySelector('.section'), waitForFirstImage);
+    document.body.classList.add('appear');
+  }
+
+  events.emit('eds/lcp', true);
 
   try {
     /* if desktop (proxy for fast connection) or fonts already loaded, load fonts.css */
@@ -177,9 +281,28 @@ async function loadLazy(doc) {
   const element = hash ? doc.getElementById(hash.substring(1)) : false;
   if (hash && element) element.scrollIntoView();
 
-  loadHeader(doc.querySelector('header'));
-  loadFooter(doc.querySelector('footer'));
+  await Promise.all([
+    loadHeader(doc.querySelector('header')),
+    loadFooter(doc.querySelector('footer')),
+    loadCSS(`${window.hlx.codeBasePath}/styles/lazy-styles.css`),
+    loadFonts(),
+    import('./acdl/adobe-client-data-layer.min.js'),
+  ]);
 
+  if (sessionStorage.getItem('acdl:debug')) {
+    import('./acdl/validate.js');
+  }
+
+  trackHistory();
+
+  // Implement experimentation preview pill
+  if ((getMetadata('experiment')
+    || Object.keys(getAllMetadata('campaign')).length
+    || Object.keys(getAllMetadata('audience')).length)) {
+    // eslint-disable-next-line import/no-relative-packages
+    const { loadLazy: runLazy } = await import('../plugins/experimentation/src/index.js');
+    await runLazy(document, { audiences: AUDIENCES }, pluginContext);
+  }
   loadCSS(`${window.hlx.codeBasePath}/styles/lazy-styles.css`);
   loadFonts();
 }
@@ -193,44 +316,67 @@ function loadDelayed() {
   // load anything that can be postponed to the latest here
 }
 
-async function loadSidekick() {
-  if (document.querySelector('aem-sidekick')) {
-    import('./sidekick.js');
-    return;
+export async function fetchIndex(indexFile, pageSize = 500) {
+  const handleIndex = async (offset) => {
+    const resp = await fetch(`/${indexFile}.json?limit=${pageSize}&offset=${offset}`);
+    const json = await resp.json();
+
+    const newIndex = {
+      complete: (json.limit + json.offset) === json.total,
+      offset: json.offset + pageSize,
+      promise: null,
+      data: [...window.index[indexFile].data, ...json.data],
+    };
+
+    return newIndex;
+  };
+
+  window.index = window.index || {};
+  window.index[indexFile] = window.index[indexFile] || {
+    data: [],
+    offset: 0,
+    complete: false,
+    promise: null,
+  };
+
+  // Return index if already loaded
+  if (window.index[indexFile].complete) {
+    return window.index[indexFile];
   }
 
-  document.addEventListener('sidekick-ready', () => {
-    import('./sidekick.js');
-  });
+  // Return promise if index is currently loading
+  if (window.index[indexFile].promise) {
+    return window.index[indexFile].promise;
+  }
+
+  window.index[indexFile].promise = handleIndex(window.index[indexFile].offset);
+  const newIndex = await (window.index[indexFile].promise);
+  window.index[indexFile] = newIndex;
+
+  return newIndex;
+}
+
+/**
+ * Check if consent was given for a specific topic.
+ * @param {*} topic Topic identifier
+ * @returns {boolean} True if consent was given
+ */
+// eslint-disable-next-line no-unused-vars
+export function getConsent(topic) {
+  console.warn('getConsent not implemented');
+  return true;
 }
 
 async function loadPage() {
   await loadEager(document);
   await loadLazy(document);
   loadDelayed();
-  loadSidekick();
-}
-
-// UE Editor support before page load
-if (window.location.hostname.includes('ue.da.live')) {
-  // eslint-disable-next-line import/no-unresolved
-  await import(`${window.hlx.codeBasePath}/ue/scripts/ue.js`).then(({ default: ue }) => ue());
 }
 
 loadPage();
 
-const { searchParams, origin } = new URL(window.location.href);
-const branch = searchParams.get('nx') || 'main';
-
-export const NX_ORIGIN = branch === 'local' || origin.includes('localhost') ? 'http://localhost:6456/nx' : 'https://da.live/nx';
-
 (async function loadDa() {
-  /* eslint-disable import/no-unresolved */
-  if (searchParams.get('dapreview')) {
-    import('https://da.live/scripts/dapreview.js')
-      .then(({ default: daPreview }) => daPreview(loadPage));
-  }
-  if (searchParams.get('daexperiment')) {
-    import(`${NX_ORIGIN}/public/plugins/exp/exp.js`);
-  }
+  if (!new URL(window.location.href).searchParams.get('dapreview')) return;
+  // eslint-disable-next-line import/no-unresolved
+  import('https://da.live/scripts/dapreview.js').then(({ default: daPreview }) => daPreview(loadPage));
 }());
